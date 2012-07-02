@@ -1,0 +1,455 @@
+#!/usr/bin/perl -w
+
+use strict;
+
+use Getopt::Long;
+use Pod::Usage;
+
+use FileHandle;
+use Text::CSV;
+use Carp;
+
+use Data::Dumper;
+
+my $CODE_KEEP   = 'KEEP';    # special constant to indicate a column not to be pdmized
+
+my ($HELP, $MAN) = (undef, undef);
+
+my $INPUT_FILE;
+my $INPUT_LOOKUPS_DIR = '';
+my $OUTPUT_DIR  = '';
+my $PRIMARY_KEY = '';
+my $PRIMARY_KEY_NAME;
+my $SKIP_FIRST  = 0;
+my $KEEP_HEADER = 0;
+
+my $RENAME_STR = '';
+my %RENAME = ();
+
+my $SKIP_NEW_ITEMS_STR = '';
+my %SKIP_NEW_ITEMS = ();
+
+my $SKIP_ERRORS = 0;
+
+my $READ_ONLY_LOOKUPS_STR = '';
+my %READ_ONLY_LOOKUPS = ();
+
+my $DEFAULT_LOOKUPS_STR = '';
+my %DEFAULT_LOOKUPS = ();
+
+my @ATTR_GROUPS_ARR = ();
+my %ATTR_GROUPS = ();
+my %ATTR_GROUPS_REV = ();
+my %ATTR_GROUPS_PARENT = ();
+
+my $MAPPING_SEPARATOR = ':';
+
+my $IGNORE_DUPS = 0;
+my $DEBUG = 0;
+
+my %CSV_OPTS_IN = (
+    'binary'        => 1,
+    'quote_char'    => '"',
+    'escape_char'   => '"');
+my %CSV_OPTS_OUT = %CSV_OPTS_IN;
+my ($IN_SEPARATOR, $OUT_SEPARATOR) = (',', ',');
+
+my $_cmdline = "$0 @ARGV";
+
+GetOptions(
+    'help|?'          => \$HELP,
+    'man'             => \$MAN,
+    'input-file=s'    => \$INPUT_FILE,
+    'input-lookups-dir=s' => \$INPUT_LOOKUPS_DIR,
+    'output-dir=s'    => \$OUTPUT_DIR,
+    'primary-key=s'   => \$PRIMARY_KEY,
+    'primary-key-name=s'   => \$PRIMARY_KEY_NAME,
+    'ignore-dups'     => \$IGNORE_DUPS,
+    'rename=s'        => \$RENAME_STR,
+    'skip-first'      => \$SKIP_FIRST,
+    'skip-errors'     => \$SKIP_ERRORS,
+    'keep-header'     => \$KEEP_HEADER,
+    'read-only=s'     => \$READ_ONLY_LOOKUPS_STR,
+    'skip-new=s'      => \$SKIP_NEW_ITEMS_STR,
+    'default=s'       => \$DEFAULT_LOOKUPS_STR,
+    'debug'           => \$DEBUG,
+    'in-separator=s'  => \$IN_SEPARATOR,
+    'out-separator=s' => \$OUT_SEPARATOR,
+    'attr-group=s'    => \@ATTR_GROUPS_ARR
+);
+
+pod2usage(-exitstatus => 0, -verbose => 1) if $HELP;
+pod2usage(-exitstatus => 0, -verbose => 2) if $MAN;
+
+$CSV_OPTS_IN{'sep_char'}  = $IN_SEPARATOR;
+$CSV_OPTS_OUT{'sep_char'} = $OUT_SEPARATOR;
+
+my $CSV_IN   = Text::CSV->new(\%CSV_OPTS_IN)  or die Text::CSV->error_diag;
+my $CSV_OUT  = Text::CSV->new(\%CSV_OPTS_OUT) or die Text::CSV->error_diag;
+
+sub process_options() {
+    map { $READ_ONLY_LOOKUPS{$_} = 1 } split /,/, $READ_ONLY_LOOKUPS_STR;
+    map { $SKIP_NEW_ITEMS{$_}    = 1 } split /,/, $SKIP_NEW_ITEMS_STR;
+    map { my ($a, $b) = split /:/; $RENAME{$a} = $b } split /,/, $RENAME_STR;
+
+    foreach my $g (@ATTR_GROUPS_ARR) {
+        my @arr = split /,/, $g;
+        die "one-sized group ('$g') do not make any sense" if @arr == 1;
+        die "$arr[0] leads more than one group" if defined $ATTR_GROUPS{$arr[0]};
+        $ATTR_GROUPS{$arr[0]} = \@arr;
+        my @parent = ();
+        for (my $i = 1; $i < @arr; $i++) {
+            $ATTR_GROUPS_REV{$arr[$i]} = $arr[0];
+            push @parent, $arr[$i];
+        }
+        $ATTR_GROUPS_PARENT{$arr[1]} = \@parent;
+        delete $ATTR_GROUPS_REV{$arr[0]};
+    }
+
+    foreach (split /,/, $DEFAULT_LOOKUPS_STR) {
+        my ($lookup, $value) = split /:/, $_, 2;
+        $DEFAULT_LOOKUPS{$lookup} = $value;
+    }
+
+    if (!$OUTPUT_DIR || !@ARGV) {
+        print STDERR "The output directory and the list of attributes must "
+                   . "be specified.\n\n";
+        pod2usage(-exitstatus => 1, -verbose => 1);
+    }
+}
+
+my @lookups = @ARGV;
+my %lookup_tables  = ();
+my %lookup_headers = ();
+my %max = ();
+
+sub load_lookups() {
+    if ($INPUT_LOOKUPS_DIR) {
+        die "Cannot read input lookups folder '$INPUT_LOOKUPS_DIR': $!"
+            unless (-d $INPUT_LOOKUPS_DIR && -r $INPUT_LOOKUPS_DIR);
+        foreach my $l (@lookups) {
+            next if (defined $lookup_tables{$l} || $l =~ /^UNUSED/ || $l =~ /^$CODE_KEEP/);
+            my $file = "$INPUT_LOOKUPS_DIR/${l}.csv";
+            if (my $fh = new FileHandle($file, 'r')) {
+                my $max   = 0;
+                my $count = 0;
+                while (my $colref = $CSV_OUT->getline($fh)) { # the file has been created by CSV_OUT
+                    my ($id, $value) = ($colref->[0], "" . $colref->[1]);
+                    if ($KEEP_HEADER && !$count) {
+                        $lookup_headers{$l} = [ $id, $value ];   
+                    } else {
+                        die "Non-numeric PK '$id' loaded from '$INPUT_LOOKUPS_DIR/${l}.csv' for lookup '$l'" unless $id =~ /^\d+$/;
+                        $lookup_tables{$l}->{$value} = $id;
+                        $max = $id if $id > $max;
+                    }
+                    $count++;
+                }
+                $max{$l} = $max;
+            }
+        }
+    }
+}
+
+my %resolved_cache = ();    # populated only by die_on_dup calls to save space
+sub resolve($$;$) {
+    my ($lookup, $value, $die_on_dup) = @_;
+    $value =~ s/^"//;
+    $value =~ s/"$//;
+
+    if ($die_on_dup && defined $resolved_cache{$lookup}->{$value}) {
+        croak "Duplicite value of '$value' found for attribute '$lookup'";
+    }
+    my $key = $lookup_tables{$lookup}->{$value};
+    unless (defined $key) {
+        return undef if $SKIP_NEW_ITEMS{$lookup}; # used to generate a lookup increment
+        if ($READ_ONLY_LOOKUPS{$lookup}) {
+            return undef;
+        }
+        $key = ++$max{$lookup};
+        #$max{$l} = $key;
+        $lookup_tables{$lookup}->{$value} = $key;
+        $resolved_cache{$lookup}->{$value} = $key if $die_on_dup;
+    }
+    return $key;
+}
+
+sub serialize_group($) {
+    my $grp_ref = shift;
+    return join("\t", @$grp_ref);
+}
+
+sub resolve_group($$$) {
+    my ($l, $lookup_no_ref, $fields_ref) = @_;
+    die "No group defined for '$l'" unless $ATTR_GROUPS{$l} && ref $ATTR_GROUPS{$l};
+    my @values = map {
+        $fields_ref->[$lookup_no_ref->{$_}];
+    } @{ $ATTR_GROUPS{$l} };
+    my $value  = serialize_group(\@values);
+    my $res    = resolve($l, $value);
+
+    return $res;
+}
+
+sub resolve_parent($$$) {
+    my ($l, $lookup_no_ref, $fields_ref) = @_;
+    die "'$l' is not a parent field (i.e. 2nd in a group)" unless $ATTR_GROUPS_PARENT{$l} && ref $ATTR_GROUPS_PARENT{$l};
+
+    my @values = map {
+        $fields_ref->[$lookup_no_ref->{$_}];
+    } @{ $ATTR_GROUPS_PARENT{$l} };
+    my $value  = serialize_group(\@values);
+    my $res    = resolve($l, $value);
+
+    return $res;
+}    
+
+sub csv_print(@) {
+    $CSV_OUT->combine(@_);
+    print $CSV_OUT->string . "\n";
+}
+
+sub process_lookup($$) {
+    my ($l, $value) = @_;
+    return undef if $l =~ /^UNUSED/ || defined $ATTR_GROUPS_REV{$l};
+
+    my $die_on_dup = !$IGNORE_DUPS && $PRIMARY_KEY eq $l;
+    my $res = resolve($l, $value, $die_on_dup);
+    $res = $DEFAULT_LOOKUPS{$l} unless defined $res;
+    unless (defined $res) {
+        die "Cannot resolve value '$value' in read-only lookup '$l', exiting";
+    }
+    return $res;
+}
+
+sub create_lookups_indices($) {
+    my $lookups_ref = shift;
+    my %lookups_no  = ();
+    for (my $i = 0; $i < @$lookups_ref; $i++) {
+        $lookups_no{$lookups_ref->[$i]} = $i; 
+    }
+    return \%lookups_no;
+}
+
+sub get_lookups_by_headers($$) {
+    my ($params_ref, $headers_ref) = @_;
+    my %hash = ();
+    foreach my $i (@$params_ref) {
+        my ($h, $l) = split /$MAPPING_SEPARATOR/, $i, 2;
+        if ($l) {
+            $hash{$h} = $l;
+        } else {
+            if (keys %hash) {
+                die "Either all or none parameters may define field to lookup mapping; '$i' is not like that";
+            }
+        }
+    }
+    if (! keys %hash) {
+        return $params_ref;
+    }
+    my @result = ();
+    foreach my $h (@$headers_ref) {
+        my $l = $hash{$h} ? $hash{$h} : $CODE_KEEP;
+        push @result, $l;
+    }
+    return \@result;
+}
+
+sub main() {
+    process_options();
+    my $fh = defined $INPUT_FILE
+        ? new FileHandle($INPUT_FILE, 'r')
+        : *STDIN;
+    croak "Cannot open '$INPUT_FILE' for reading: $!" unless $fh;
+    my $first = 1;
+
+    my %lookups_no = %{ create_lookups_indices(\@lookups) };    # first lookup's occurence index
+
+    ITERATE:
+    while (my $colref = $CSV_IN->getline($fh)) {
+        if ($first) {
+            @lookups = @{ get_lookups_by_headers(\@lookups, $colref) };
+            # fix previously created hash with new @lookups
+            %lookups_no = %{ create_lookups_indices(\@lookups) };
+            load_lookups();
+        }
+        if (!($SKIP_FIRST && $first)) {
+            my @fields = @$colref;
+    
+            die "The number of declared attributes (@lookups, #" . (0 + @lookups) . ") must be smaller than "
+                . "number of fields (@fields, #" . (0 + @fields) . ") in the input CSV" if @fields < @lookups;
+    
+            my @out = ();
+            my $pk_value = undef;
+            my @groups = ();
+            my $i;
+            for ($i = 0; $i < @lookups; $i++) {
+                my $l     = $lookups[$i];
+                next if $l =~ /^UNUSED/;
+                my $value = $fields[$i];
+                my $res;
+                if ($first && $KEEP_HEADER) {
+                    $res = defined $RENAME{$value} ? $RENAME{$value} : $value;
+                } elsif ($l =~ /^$CODE_KEEP/) {
+                    $res = $value;
+                } else {
+                    $pk_value = $value if $l eq $PRIMARY_KEY;
+                    if ($ATTR_GROUPS{$l}) {
+                        $res = resolve_group($l, \%lookups_no, \@fields);
+                    } elsif ($ATTR_GROUPS_PARENT{$l}) {
+                        $res = resolve_parent($l, \%lookups_no, \@fields);
+                    } else {
+                        $res = process_lookup($l, $value);
+                        next unless defined $res;
+                    }
+                }
+                push @out, $res;
+            }
+    
+            my @toadd = splice @fields, $i;
+            push @out, @toadd;
+            if ($PRIMARY_KEY) {
+                if ($first && $KEEP_HEADER) {
+                    $pk_value = $PRIMARY_KEY_NAME ? $PRIMARY_KEY_NAME : 'Original Id';
+                }
+                splice @out, 1, 0, $pk_value; # insert after first field
+                #unshift @out, $hash{$PRIMARY_KEY};
+            }
+    
+            csv_print(@out);
+        }
+        $first = 0;
+    }
+    goto ITERATE unless $CSV_IN->eof;
+    dump_lookups();
+}
+
+sub dump_lookups() {
+    foreach my $l (@lookups) {
+        #next if $l eq $PRIMARY_KEY;
+        next if defined $READ_ONLY_LOOKUPS{$l};
+        next if defined $ATTR_GROUPS_REV{$l};
+        next if $l =~ /^$CODE_KEEP/;
+        next if $l =~ /^UNUSED/;
+        my $fh = new FileHandle("$OUTPUT_DIR/${l}.csv", 'w');
+        if ($KEEP_HEADER) {
+            $lookup_headers{$l} = [ 'id', 'name' ] unless $lookup_headers{$l};
+            $CSV_IN->combine(@{$lookup_headers{$l}});
+            print $fh $CSV_IN->string . "\n";
+        }
+        while (my($v,$k) = each %{ $lookup_tables{$l} }) {
+            $CSV_IN->combine($k, $v);
+            print $fh $CSV_IN->string . "\n";
+            #print $fh "\"$k\"$IN_SEPARATOR\"$v\"\n";
+        }
+        $fh->close;
+    }
+}
+
+main();
+
+__END__
+=head1 NAME
+
+surrogate - consistently replaces labels with auto-generated keys and persists the
+            generated key/label pairs for future runs
+
+=head1 SYNOPSIS
+
+ surrogate [options] lookups
+
+ # Generate keys for first two fields and store [ generated key, orig value]
+ # pairs in out/dim_name.csv and out/dim_industry.csv lookup files.
+ # All fields except for the first two are dumped unchanged.
+ surrogate --input-file=data.csv \
+     output-dir=out dim_name dim_industry \
+     > out/data.csv
+
+ # copy previously generated lookup files into an extra folder
+ cp out/dim_*.csv lookups_cache/
+
+ # Preload lookups from the lookups_cache folder before processing. Don't generate
+ # keys for values that has their keys already stored in corresponding files within
+ # the lookups_cache/ folder.
+ surrogate --input-file=data.csv --input-lookups-dir=lookups_cache \
+      output-dir=out dim_name dim_industry \
+      > out/data.csv
+
+ # The same as above except for the processing exits if a non-resolved value
+ # is found in the second field
+ surrogate --input-file=data.csv --input-lookups-dir=lookups_cache \
+      --read-only=dim_industry \
+      output-dir=out dim_name dim_industry \
+      > out/data.csv
+
+ # Process a file with hierarchical attributes (a GEO dimension is used in this
+ # example). The --attr-group option tells to distinguish e.g. Albany, NY, USA from
+ # Albany, OR, USA or Albany, WA, Australia.
+ surrogate --input-file=data.csv --input-lookups-dir=my_geo_dir --output-dir=out \
+      --attr-group=dim_city,dim_state,dim_country \
+      dim_city dim_state dim_country > out/data.csv
+ 
+=head1 OPTIONS
+
+ --help, -h               short help screen
+ --man                    slightly more detailed documentation
+ --ignore-dups            by default, a column marked as a primary key
+                          using the --primary-key option is required to hold
+                          unique values. The --ignore-dups switch removes this
+                          constrain.
+ --input-file=path        input file with values to be replaced with keys
+                          (STDIN is used by default)
+ --input-lookups-dir=path folder containing already existing lookup files
+                          (i.e. files hodling key-value pairs)
+ --output-dir=path        folder where the key-value pairs accumulated during
+                          processing will be dumped. Each file's name will be
+                          based on the given lookup name (see ARGUMENTS below)
+                          with the 'csv' suffix.
+                          If some lookups has been preloaded from the folder
+                          specified via --input-lookup-dir, the dumped lookup
+                          files will contain the preloaded key-value pairs as
+                          well as those generated during this processing.
+ --primary-key=name       the field marked as 'primary-key' is not replaced, 
+                          the generated key is inserted before the primary key
+                          instead. Only first field may be marked as primary
+                          key.
+ --primary-key-name=name  the name of column of the original primary key
+                          ('Original Id' by default). This option is ignored
+                          unless --primary-key is specified.
+ --skip-first             to silently discard the first row
+ --keep-header            to keep fields of the first row that correspond to 
+                          fields to be dumped
+ --read-only=list         comma separated list of fields that are not expecged
+                          to contain other values that those preloaded from 
+                          input-lookups-dir. The processing fails if such an
+                          unknown value occurs.
+ --rename=list            comma separated list of colon separated pairs of
+                          old and new column names. Defines how the original
+                          names should be renamed in the output file. 
+ --skip-new               skip records with unresolved lookups (TODO doesn't work
+                          properly yet)
+ --default=pairs          list of lookups specific default values for new
+                          values, use key correspnding to the given value
+                          rather than generating a new values. 
+                          Useful for garbage workarounds
+                          Example: --default=company:1,industry:1
+ --debug                  Print some possibly interesting processing info
+ --attr-group=list        Values of the first field of the group list are
+                          replaced with keys specified to the whole value
+                          groups rather than to the first field's value only.
+                          Useful for processing hierarchical attributes
+ --in-separator=char      field separator in the source file ("," by default)
+ --out-separator=char     output field separator ("," by default)
+
+=head1 ARGUMENTS
+
+The script arguments represent lookup files corresponding to each column
+of the input file. The number of arguments must be smaller or equal to the
+number of columns.
+
+Special lookup names:
+- prefixed with 'UNUSED' - these columns will be discarded silently
+- prefixed with 'KEEP' - the original value will be printed to output without any processing
+
+=head1 AUTHORS
+
+Pavel Kolesnikov <pavel@gooddata.com>

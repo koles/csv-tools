@@ -1,0 +1,132 @@
+#!/usr/bin/perl -w
+
+use strict;
+
+use Text::CSV;
+use DateTime;
+use FileHandle;
+use Getopt::Long;
+use Pod::Usage;
+
+use Carp;
+
+my ($IN_SEPARATOR, $OUT_SEPARATOR) = (',', ',');
+my ($HELP, $MAN, $KEEP);
+my $JOIN_STR;
+my @JOIN = ();
+
+GetOptions(
+    'help|?'          => \$HELP,
+    'man'             => \$MAN,
+    'keep'            => \$KEEP,
+    'join=s'          => \$JOIN_STR,
+    'in-separator=s'  => \$IN_SEPARATOR,
+    'out-separator=s' => \$OUT_SEPARATOR
+);
+
+@JOIN = split /,/, $JOIN_STR if $JOIN_STR;
+
+pod2usage(-exitstatus => 0, -verbose => 1) if $HELP;
+pod2usage(-exitstatus => 0, -verbose => 2) if $MAN;
+
+my ($SUPERSET_KEY, $SUPERSET_FILE, $SUBSET_KEY, $SUBSET_FILE) = @ARGV;
+
+pod2usage(-exitstatus => 1, -verbose => 1) unless ($SUBSET_KEY);
+
+my $CSV_IN  = Text::CSV->new({ binary => 1, sep_char => $IN_SEPARATOR });
+my $CSV_OUT = Text::CSV->new({ binary => 1, sep_char => $OUT_SEPARATOR });
+
+sub main() {
+    my %superset_keys = ();
+    process_csv($SUPERSET_FILE, \&build_superset_keys,
+        [ $SUPERSET_KEY, \%superset_keys ]);
+
+    process_csv($SUBSET_FILE, \&dump_valid_line,
+        [ $SUBSET_KEY, \%superset_keys ], 1);
+}
+
+sub process_csv($$$;$) {
+    my ($file, $sub, $params, $dump_headers) = @_;
+    my $fh = $file
+        ? new FileHandle($file, 'r')
+        : *STDIN; 
+    croak "Cannot open '$file' for reading: $!" unless $fh;
+
+    my @headers = @{ $CSV_IN->getline($fh) or croak "Cannot parse header line: $!" };
+    if ($dump_headers) {
+        my @out = @headers;
+        push @out, @JOIN;
+        $CSV_OUT->combine(@out);
+        print $CSV_OUT->string . "\n";
+    }
+    $CSV_IN->column_names(@headers);         # Set column names for getline_hr ()
+    until ($CSV_IN->eof) {
+        my $hash = $CSV_IN->getline_hr($fh) or next;
+        $sub->(\@headers, $hash, @$params);
+    }
+
+    close $fh if $file;
+}
+
+sub build_superset_keys($$$$) {
+    my ($headers, $hash, $key, $keys) = @_;
+    $keys->{$hash->{$key}} = $hash;
+}
+
+sub dump_valid_line($$$$$) {
+    my ($headers, $hash, $key, $sup_keys) = @_;
+    my $sup = $sup_keys->{$hash->{$key}};
+    my @out;
+    if (defined $sup) {
+        @out = map { $hash->{$_} } @$headers;
+        push @out, map { $sup->{$_} } @JOIN;
+        $CSV_OUT->combine(@out);
+        print $CSV_OUT->string . "\n";
+    } elsif ($KEEP) {
+        @out = map { ($_ eq $SUBSET_KEY) ? '' : $hash->{$_} } @$headers;
+        push @out, map { '' } @JOIN;
+        $CSV_OUT->combine(@out);
+        print $CSV_OUT->string . "\n";
+    }
+}
+
+main();
+
+__END__
+=head1 NAME
+
+clean_mapping - referencial integrity cleanup tool. Filters out lines that
+                violate the specified referencial integrity constrain.
+
+=head1 SYNOPSIS
+
+ clean_mapping [options] pk_column_name referenced_csv_file \
+                         fk_column_name processed_csv_file
+ clean_mapping [options] pk_column_name referenced_csv_file \
+                         fk_column_name < processed_csv_file
+
+ Example:
+
+ #
+ # filter out rows of salaries.csv that contain an 'Employee ID' value with
+ # no matching value of 'ID' in employees.csv
+ # 
+ check_mapping salaries.csv 'Employee ID' employees.csv 'ID'
+
+=head1 OPTIONS
+
+ --help, -h               short help screen
+ --man                    slightly more detailed documentation
+ --keep                   keeps the violating lines but replaces offending
+                          foreign keys with blanks
+ --join=list              comma separated list of the fields from the referenced 
+                          CSV file to be added to output stream. An equivalent 
+                          of performing an inner join (or an outer join if the
+                          --keep switch is used)
+ --in-separator=char      field separator in the source file ("," by default)
+ --out-separator=char     output field separator ("," by default)
+
+=head1 AUTHORS
+
+Pavel Kolesnikov <pavel@gooddata.com>
+

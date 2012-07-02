@@ -1,0 +1,71 @@
+#!/usr/bin/perl -w
+
+use strict;
+use Getopt::Long;
+use Text::CSV;
+use FileHandle;
+use Pod::Usage;
+
+my $LINES = undef;
+
+my $IN_SEPARATOR = ',';
+my $MAX_LENGTH   = 0;
+ 
+my ($HELP, $MAN);
+
+GetOptions(
+    'help|?'          => \$HELP,
+    'man'             => \$MAN,
+    'lines'          => \$LINES,
+    'max-length'     => \$MAX_LENGTH,
+    'in-separator=s' => \$IN_SEPARATOR
+);
+
+pod2usage(-exitstatus => 0, -verbose => 1) if $HELP;
+pod2usage(-exitstatus => 0, -verbose => 2) if $MAN;
+
+my $CSV     = Text::CSV->new({ 'binary' => 1, 'sep_char' => $IN_SEPARATOR });
+
+my $fh = @ARGV ? new FileHandle($ARGV[0], 'r') : *STDIN;
+
+my @fields = @{ $CSV->getline($fh) };
+my $count  = 0;
+my %max_len = ();
+
+if ($MAX_LENGTH) {
+    $CSV->column_names(\@fields);
+    while (my $hash = $CSV->getline_hr($fh)) {
+        foreach my $k (keys %$hash) {
+            my $l = length $hash->{$k};
+            $max_len{$k} = $l if !defined $max_len{$k} ||$l > $max_len{$k};
+        }
+    }
+}
+
+foreach (@fields) {
+    my $pfx = $LINES ? $count++ . "\t" : "";
+    my $app = $MAX_LENGTH ? "\t" . $max_len{$_} : "";
+    print "$pfx$_$app\n";
+}
+
+__END__
+=head1 NAME
+
+list_headers - prints fields in the first line of given CSV file line by line
+
+=head1 SYNOPSIS
+
+ list_headers [options] file.csv
+ list_headers [options] < file.csv
+
+=head1 OPTIONS
+
+ --help, -h           short help screen
+ --man                slightly more detailed documentation
+ --max-lenth          print maximal length for each column
+ --in-separator=char  field separator in the source file ("," by default)
+
+=head1 AUTHORS
+
+Pavel Kolesnikov <pavel@gooddata.com>
+

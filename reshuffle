@@ -1,0 +1,187 @@
+#!/usr/bin/perl -w
+
+use strict;
+
+use Getopt::Long;
+use Pod::Usage;
+
+use Text::CSV;
+use Carp;
+use FileHandle;
+
+my ($HELP, $MAN) = (undef, undef);
+my $NUMBERS = 0;
+my $INPUT_FILE;
+my ($INSERT_FIELD, $INSERT_AFTER_STR, $INSERT_BEFORE_STR) = ('N/A', undef, undef);
+
+my %INSERT_AFTER = ();
+my %INSERT_BEFORE = ();
+
+my %CSV_OPTS_IN = (
+    'binary'        => 1,
+    'quote_char'    => '"',
+    'escape_char'   => '"',
+);
+my %CSV_OPTS_OUT = %CSV_OPTS_IN;
+my $TRANSL_SEPARATOR = ':';
+my ($IN_SEPARATOR, $OUT_SEPARATOR) = (',', ',');
+my $SKIP_FIRST = undef;
+
+GetOptions(
+    'help|?'           => \$HELP,
+    'man'              => \$MAN,
+    'input-file=s'     => \$INPUT_FILE,
+    'numbers'          => \$NUMBERS,
+    'insert-field=s'   => \$INSERT_FIELD,
+    'insert-after=s'   => \$INSERT_AFTER_STR,
+    'insert-before=s'  => \$INSERT_BEFORE_STR,
+    'skip-first'       => \$SKIP_FIRST,
+    'transl-separator' => \$TRANSL_SEPARATOR,
+    'in-separator=s'   => \$IN_SEPARATOR,
+    'out-separator=s'  => \$OUT_SEPARATOR,
+);
+
+pod2usage(-exitstatus => 0, -verbose => 1) if $HELP;
+pod2usage(-exitstatus => 0, -verbose => 2) if $MAN;
+
+$IN_SEPARATOR = "\t"  if $IN_SEPARATOR eq 'TAB';
+$OUT_SEPARATOR = "\t" if $OUT_SEPARATOR eq 'TAB';
+
+$CSV_OPTS_IN{'sep_char'}  = $IN_SEPARATOR;
+$CSV_OPTS_OUT{'sep_char'} = $OUT_SEPARATOR;
+
+if (defined $INSERT_AFTER_STR)  { $INSERT_AFTER{'_' . $_}++ foreach split /,/, $INSERT_AFTER_STR  }
+if (defined $INSERT_BEFORE_STR) { $INSERT_BEFORE{'_' . $_}++ foreach split /,/, $INSERT_BEFORE_STR }
+
+my $CSV_IN     = Text::CSV->new(\%CSV_OPTS_IN)  or die Text::CSV->error_diag;
+my $CSV_OUT    = Text::CSV->new(\%CSV_OPTS_OUT) or die Text::CSV->error_diag;
+
+my @indexes = @ARGV;
+my %index_translations = ();
+# backward compatibility hack: if no --input-file is provided
+# and the first parameter is a path to an existing file, treat
+# this parameters as the input file.
+if (!$INPUT_FILE && @indexes && ($indexes[0] eq '-' || -r $indexes[0])) {
+    $INPUT_FILE = shift @indexes;
+}
+
+foreach my $i (@indexes) {
+    my ($from, $to) = split /$TRANSL_SEPARATOR/, $i, 2;
+    if ($to) {
+        $index_translations{$from} = $to;
+        $i = $from;
+    }
+}
+
+my %numbers_utils = (
+    'load_headers' => sub($) { $CSV_IN->getline($_[0]) if $SKIP_FIRST; return undef },
+    'get_line_ref' => sub($) { $CSV_IN->getline($_[0]) },
+    'get_fields_no'=> sub($) { '' . @{ $_[0] } },
+    'get_value'    => sub($$) { $_[0]->[$_[1]] }
+);
+
+my %headers_utils = (
+    'load_headers' => sub($) {
+        my @h = @{ $CSV_IN->getline($_[0]) or croak "Cannot parse header line: $!" };
+        $CSV_IN->column_names(@h);
+        $CSV_OUT->combine(map { $index_translations{$_} ? $index_translations{$_} : $_ } @indexes);
+        print $CSV_OUT->string . "\n";
+    },
+    'get_line_ref' => sub($) { $CSV_IN->getline_hr($_[0]) },
+    'get_fields_no'=> sub($) { '' . keys %{ $_[0] } },
+    'get_value'    => sub($$) { $_[0]->{$_[1]} }
+);
+
+sub generate_list($$) {
+    my ($string, $number) = @_;
+    my @out = ();
+    if ($number) {
+        for (my $i = 0; $i < $number; $i++) {
+            push @out, $string;
+        }
+    }
+    return @out;
+}
+
+sub main() {
+    my $fh;
+    if (!$INPUT_FILE || $INPUT_FILE eq '-') {
+        $fh = *STDIN;
+    } else {
+        $fh = new FileHandle $INPUT_FILE, 'r' or croak "Cannot open '$INPUT_FILE' for reading: $!";
+    }
+    my %utils = $NUMBERS || !@indexes ? %numbers_utils : %headers_utils;
+    $utils{'load_headers'}->($fh);
+
+    until ($CSV_IN->eof) {
+        my $ref = $utils{'get_line_ref'}->($fh);
+        last if !$ref && $CSV_IN->eof;
+        my @out = ();
+        unless (@indexes) {
+            my $max = $utils{'get_fields_no'}($ref) - 1;
+            @indexes = 0..$max;
+        }
+        for my $i (@indexes) {
+            my $value = $utils{'get_value'}->($ref, $i);
+            push @out, generate_list($INSERT_FIELD, $INSERT_BEFORE{"_$i"});
+            push @out, $value;
+            push @out, generate_list($INSERT_FIELD, $INSERT_AFTER{"_$i"});
+        }
+        $CSV_OUT->combine(map { my $l = $_; $l =~ s/\x0//g; $l } @out);
+        print $CSV_OUT->string . "\n";
+    }
+}
+
+main();
+
+__END__
+=head1 NAME
+
+reshuffle - reorganizes the columns of a CSV file specified by index or name
+
+=head1 SYNOPSIS
+
+ reshuffle [options] file [field ... ]
+
+ # drop second field and swap third and fourth using field names
+ reshuffle data.csv column_name1 column_name3 column_name2
+
+ # The same using indexes + read pipe separated and dump hash separated fields
+ reshuffle --numbers --in-separator='|' --out-separator='#' data.csv 0 3 2
+
+ # Insert 'N/A' before the first output field and after 6th field
+ reshuffle --insert-fields=N/A --insert-before=0 --insert-after=5 data.csv
+
+=head1 OPTIONS
+
+ --help, -h               short help screen
+ --man                    slightly more detailed documentation
+ --numbers                specify output fields by indexes rather than by
+                          numbers starging from 0.
+ --insert-field=string    string to be used by --insert-before and
+                          --insert-after ("N/A" by default)
+ --insert-after=indexes   comma separated list of indexes after which an
+                          extra string should be inserted
+ --insert-before=indexes  comma separated list of indexes before which an
+                          extra string should be inserted
+ --skip-first             drop the first line
+ --in-separator=char      field separator in the source file ("," by default)
+ --out-separator=char     output field separator ("," by default)
+
+=head1 ARGUMENTS
+
+ First argument            The following cases are handled especially for the sake of
+                           backward compatibility unless the --input-file option is
+                           provided:
+                           1) If a so named file exist, it is treated as the input
+                           file name.
+                           2) If equal to '-' the input is expceted on STDIN.
+ Following arguments       Identify fields present in the output stream.
+                           By default, field names as defined in the CSV header
+                           are expected. If the --numbers option is used, numeric
+                           indexes are expected instead.
+                           Using no fields is a shortcut for enumerating all fields.
+
+=head1 AUTHORS
+
+Pavel Kolesnikov <pavel@gooddata.com>

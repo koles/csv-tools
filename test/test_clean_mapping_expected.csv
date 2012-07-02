@@ -1,0 +1,5 @@
+User,Browser,Date,Hour,DataTransfer
+Jane,Firefox,2010-02-01,01:00,100
+John,IE,2010-02-01,01:00,100
+Jane,Firefox,2010-02-01,02:00,100
+John,Firefox,2010-02-01,02:00,50

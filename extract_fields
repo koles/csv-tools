@@ -1,0 +1,68 @@
+#!/usr/bin/perl -w
+
+use strict;
+
+use Getopt::Long;
+
+use FileHandle;
+use Text::CSV;
+
+my $FIELDS_SEPARATOR = ' ';
+my ($INFILE, $OUTFILE) = ('-', '-');
+
+GetOptions(
+    'field-separator=s' => \$FIELDS_SEPARATOR,
+    'input-file=s'      => \$INFILE,
+    'output-file=s'     => \$OUTFILE
+);
+my ($ID, $TAGS) = @ARGV;
+
+die "Usage: $0 [--field-separator=<sep>] <id column name> <fields column name>" unless $TAGS;
+
+my %CSV_OPTS = (
+    'binary'        => 1,
+    'quote_char'    => '"',
+    'escape_char'   => '"');
+
+my $CSV   = Text::CSV->new(\%CSV_OPTS)  or die Text::CSV->error_diag;
+
+sub main() {
+    my $fh_in = (!$INFILE || $INFILE eq '-')
+        ? *STDIN
+        : new FileHandle($INFILE, 'r');
+    die "Cannot open input '$INFILE': $!" unless $fh_in;
+    my $fh_out = (!$OUTFILE || $OUTFILE eq '-')
+        ? *STDOUT
+        : new FileHandle($OUTFILE, 'w');
+    die "Cannot open output '$OUTFILE': $!" unless $fh_out;
+
+    my @headers = @{ $CSV->getline($fh_in) or die Text::CSV->error_diag };
+    $CSV->column_names(@headers);
+
+    out($fh_out, $ID, $TAGS);
+
+    until ($CSV->eof) {
+        my $hr = $CSV->getline_hr($fh_in) or do {
+            last if $CSV->eof;
+            warn Text::CSV->error_diag;
+            next;
+        };
+        my @tags;
+        if ($hr->{$TAGS}) {
+            @tags = split /$FIELDS_SEPARATOR+/, $hr->{$TAGS};
+        } else {
+            @tags = ( "N/A" );
+        }
+        foreach my $t (@tags) {
+            out($fh_out, $hr->{$ID}, $t);
+        }
+    }
+}
+
+sub out($;@) {
+    my $fh = shift;
+    $CSV->combine(@_);
+    print $fh $CSV->string . "\n";
+}
+
+main();

@@ -1,0 +1,293 @@
+#!/usr/bin/perl -w
+
+use strict;
+
+use Getopt::Long;
+use Pod::Usage;
+
+use FileHandle;
+use Text::CSV;
+
+my %CSV_OPTS_IN = (
+    'binary'        => 1,
+    'quote_char'    => '"',
+    'escape_char'   => '"');
+my %CSV_OPTS_OUT = %CSV_OPTS_IN;
+my ($IN_SEPARATOR, $OUT_SEPARATOR) = (',', ',');
+
+my ($AGGREGATE_BY_STR, @AGGREGATE_BY);
+my $AGGREGATE_NOT_BY_STR;
+my ($FACT_STR, @FACT);
+my $NO_ESCAPES;
+my $INPUT_FILE;
+
+my ($HELP, $MAN, $DEBUG);
+
+GetOptions(
+    'help|?'          => \$HELP,
+    'man'             => \$MAN,
+    'debug'           => \$DEBUG,
+    'by=s'            => \$AGGREGATE_BY_STR,
+    'by-all-except=s' => \$AGGREGATE_NOT_BY_STR,
+    'fact=s'          => \$FACT_STR,
+    'input-file=s'    => \$INPUT_FILE,
+    'no-escapes'      => \$NO_ESCAPES,
+    'in-separator=s'  => \$IN_SEPARATOR,
+    'out-separator=s' => \$OUT_SEPARATOR
+);
+
+pod2usage(-exitstatus => 0, -verbose => 1) if $HELP;
+pod2usage(-exitstatus => 0, -verbose => 2) if $MAN;
+
+if (!($AGGREGATE_BY_STR || $AGGREGATE_NOT_BY_STR)
+       || ($AGGREGATE_BY_STR && $AGGREGATE_NOT_BY_STR)) {
+    print STDERR "Either the list of fields to aggregate by or not to aggregate\n"
+                ,"by must be specified\n\n";
+    pod2usage(-exitstatus => 1, -verbose => 1);
+}
+
+$CSV_OPTS_IN{'sep_char'}  = $IN_SEPARATOR;
+$CSV_OPTS_OUT{'sep_char'} = $OUT_SEPARATOR;
+
+my $CSV_IN  = $NO_ESCAPES
+    ? PseudoCSV->new(\%CSV_OPTS_IN)
+    : Text::CSV->new(\%CSV_OPTS_IN)  or die Text::CSV->error_diag;
+my $CSV_OUT = $NO_ESCAPES
+    ? PseudoCSV->new(\%CSV_OPTS_OUT)
+    : Text::CSV->new(\%CSV_OPTS_OUT) or die Text::CSV->error_diag;
+
+sub main() {
+    my $fh_in = defined $INPUT_FILE
+       ? new FileHandle($INPUT_FILE, 'r')
+       : *STDIN;
+    die "Cannot open the input file '$INPUT_FILE': $!" unless $fh_in;
+    my @headers = @{ $CSV_IN->getline($fh_in) };
+
+    my ($fact, $aggregate_by) = @{ prepare_fields($fh_in, \@headers) };
+
+    my @FACT         = @$fact;
+    my @AGGREGATE_BY = @$aggregate_by;
+
+    printf STDERR "Facts to aggregate: %s\n", join(', ', @FACT) if $DEBUG;
+    printf STDERR "Aggregate by      : %s\n", join(', ', @AGGREGATE_BY) if $DEBUG;
+
+    my %aggregation = ();
+    my %count       = ();
+
+    $CSV_IN->column_names(\@headers);
+    my ($hr, @key, $key, $f);
+    my $report_each   = 10000;
+    my $counter       = 0;
+    my $group_counter = 0;
+    while ($hr = $CSV_IN->getline_hr($fh_in)) {
+        @key = map { $hr->{$_} } @AGGREGATE_BY;
+        $key = combine($CSV_IN, \@key);
+        foreach $f (@FACT) {
+            $aggregation{$key}->{$f} += $hr->{$f};
+        }
+        $count{$key}++;
+        if ($DEBUG) {
+           if (++$counter == $report_each) {
+               $group_counter++;
+               printf STDERR "% 9d rows processed\n", $group_counter * $report_each;
+               $counter = 0;
+           }
+        }
+    }
+
+    dump_aggregation(\%aggregation, \%count, \@FACT, \@AGGREGATE_BY);
+}
+
+sub dump_aggregation($$$$$) {
+    my ($aggregation, $count, $fact, $aggregate_by) = @_;
+    my $fh_out = *STDOUT;
+
+    # print header
+    my @header = ();
+    push @header, @$aggregate_by;
+    push @header, @$fact;
+    push @header, 'Count';
+    print $fh_out combine($CSV_OUT, \@header) . "\n";
+
+    # print aggregated values
+    my @out = ();
+    my @key;
+    foreach my $key (keys %$count) {
+        @out = parse($CSV_IN, $key);
+        push @out, map { $aggregation->{$key}->{$_} } @$fact;
+        push @out, $count->{$key};
+        print $fh_out combine($CSV_OUT, \@out) . "\n";
+    }
+}
+
+sub prepare_fields($$) {
+    my ($fh_in, $headers) = @_;
+    if ($FACT_STR) {
+        my %hash = ();
+        map { $hash{$_} = 1 } split /,/, $FACT_STR;
+        @FACT = grep { $hash{$_} } @$headers;
+    } else {
+        @FACT = ();
+    }
+    if ($AGGREGATE_BY_STR) {
+        my %hash = ();
+        map { $hash{$_} = 1 } split /,/, $AGGREGATE_BY_STR;
+        @AGGREGATE_BY = grep { $hash{$_} } @$headers;
+    } else {
+        my %hash = ();
+        map { $hash{$_} = 1 } split /,/, $AGGREGATE_NOT_BY_STR;
+        map { $hash{$_} = 1 } @FACT;
+        @AGGREGATE_BY = grep { !$hash{$_} } @$headers;
+    }
+    return [ \@FACT, \@AGGREGATE_BY ];
+}
+
+sub combine($$) {
+    my ($csv, $colref) = @_;
+    $csv->combine(@$colref);
+    return $csv->string;
+}
+
+sub parse($$) {
+    my ($csv, $str) = @_;
+    $csv->parse($str) or die "Cannot parse CSV string '$str'";
+    return $csv->fields;
+}
+
+main();
+
+package PseudoCSV;
+
+sub new {
+    my $class = shift;
+    my $opts  = shift;
+
+    my %default = (
+        'sep_char' => ','
+    );
+    $opts = {} unless $opts;
+    while (my ($k, $v) = each %default) {
+        $opts->{$k} = $v unless defined $opts->{$k};
+    }
+    bless $opts, $class;
+}
+
+sub getline($$) {
+    my ($self, $fh) = @_;
+    my $line = <$fh>;
+    chomp $line;
+    my @fields = split /$self->{sep_char}/, $line;
+    return \@fields;
+}
+
+sub column_names($$) {
+    my ($self, $headers) = @_;
+    $self->{headers} = $headers;
+}
+
+sub getline_hr($$) {
+    my ($self, $fh) = @_;
+    my $line = <$fh>;
+    return unless $line;
+    chomp $line;
+    my $i = 0;
+    my $res = {};
+    my ($key, $f);
+    foreach $f (split /$self->{sep_char}/, $line) {
+        $key = $self->{headers}->[$i++];
+        $res->{$key} = $f if defined $key;
+    }
+    return $res;
+}
+
+sub combine($@) {
+    my $self = shift;
+    $self->{combined} = join $self->{sep_char}, @_;
+}
+
+sub string($) {
+    my $self = shift;
+    return $self->{combined};
+}
+
+sub parse($$) {
+    my ($self, $str) = @_;
+    my @parsed = split /$self->{sep_char}/, $str;
+    $self->{parsed} = \@parsed;
+}
+
+sub fields($) {
+    my $self = shift;
+    return @{ $self->{parsed} };
+}
+
+__END__
+=head1 NAME
+
+aggregate - aggregates facts in the input CSV file by given attributes and appends 
+            the count fact to each row. The result is printed on the standard output.
+
+Note: the aggregation is performed in memory which may result in high memory consumption
+      in case of inefficient aggregation on a large input dataset
+
+=head1 SYNOPSIS
+
+ aggregate [options] < file.csv > aggregated_file.csv
+
+ #
+ # The examples below suppose a test/test.csv file containing the content as follows:
+ #    User,Browser,Date,Hour,DataTransfer
+ #    Jane,Firefox,2010-02-01,01:00,100
+ #    John,IE,2010-02-01,01:00,100
+ #    Jane,Firefox,2010-02-01,02:00,100
+ #    John,Firefox,2010-02-01,02:00,50
+ #    Kim,Chrome,2010-02-01,02:00,100
+ #
+
+ #
+ # Aggregate the DataTransfer fact in the input CSV by the Date and Hour columns
+ # Expected output:
+ #   Date,Hour,DataTransfer,Count
+ #   2010-02-01,01:00,200,2
+ #   2010-02-01,02:00,250,3
+ #
+ aggregate --by=Date,Hour --fact=DataTransfer < test/test.csv > tranfer_by_time.csv
+
+ #
+ # No fact declared implies it's possible to group by any combination of fields.
+ # Only the Count aggregation will be created.
+ # This example aggregates only the count of lines in the input CSV by all
+ # fields except Date and Hour.
+ # Expected output:
+ #   User,Browser,DataTransfer,Count
+ #   Jane,Firefox,100,2
+ #   John,IE,100,1
+ #   John,Firefox,50,1
+ #   Kim,Chrome,100,1
+ #
+ aggregate --by-all-except=Date,Hour < test/test.csv > aggregated.csv
+
+=head1 OPTIONS
+
+ --help, -h               short help screen
+ --man                    slightly more detailed documentation
+ --input-file=path        input file (STDIN by default)
+ --fact=list              list of fields to be treated as facts. Sum of each of these
+                          fields will be computed. If not provided, only the count of
+                          rows will be provided
+ --by=list                comma separated list to aggregate by. Either 'by' or
+                          'by-all-except' option must be specified.
+ --by-all-except=list     facts will be aggregated by all field except those specified
+                          using this or --fact options          
+ --no-escape              signifies the values in the input CSV do not cantain
+                          the separator so a simple 'split' function can be
+                          used instead of a complete CSV implementation
+ --debug                  prints some debug information and progress by tens of
+                          thousands processed input lines
+ --in-separator=char      field separator in the source file ("," by default)
+ --out-separator=char     output field separator ("," by default)
+
+=head1 AUTHORS
+
+Pavel Kolesnikov <pavel@gooddata.com>
+
