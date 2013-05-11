@@ -1,8 +1,9 @@
 csv-tools
 =========
 
-CSV exploration and manipulation tools. An overview of help screens
-follows:
+CSV exploration and manipulation tools.
+
+An overview of help screens follows. If you need an RFC-4180 compliant alternative of the `cut` unix command, scroll down to the `reshuffle` tool.
 
 aggregate
 ---------
